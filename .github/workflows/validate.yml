@@ -36,6 +36,7 @@ jobs:
           load: true
           cache-from: type=gha,scope=brands-image-validation-linux-amd64
           cache-to: type=gha,scope=brands-image-validation-linux-amd64,mode=max,ignore-error=true
+          no-cache-filters: runtime
           push: false
 
       - name: Generate SBOM and enforce High/Critical gate
