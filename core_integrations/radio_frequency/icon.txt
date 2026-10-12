@@ -1,1 +1,0 @@
-mdi:video-input-antenna
