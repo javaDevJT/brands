@@ -7,6 +7,9 @@ on:
     - cron: "22 0 * * *"
       timezone: "America/Detroit"
 
+env:
+  DOCKER_BUILD_RECORD_RETENTION_DAYS: "1"
+
 jobs:
   validate:
     name: Images
