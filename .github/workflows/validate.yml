@@ -7,6 +7,8 @@ on:
     - cron: "22 0 * * *"
       timezone: "America/Detroit"
 
+env:
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
 jobs:
   validate:
     name: Images
