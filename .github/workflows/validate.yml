@@ -66,72 +66,195 @@ jobs:
           import re
           import sys
 
+          INDEX_MEDIA_TYPES = {
+              "application/vnd.oci.image.index.v1+json",
+              "application/vnd.docker.distribution.manifest.list.v2+json",
+          }
+          IMAGE_MEDIA_TYPES = {
+              "application/vnd.oci.image.manifest.v1+json",
+              "application/vnd.docker.distribution.manifest.v2+json",
+          }
+          IMAGE_CONFIG_MEDIA_TYPES = {
+              "application/vnd.oci.image.config.v1+json",
+              "application/vnd.docker.container.image.v1+json",
+          }
+          MAX_INDEX_DEPTH = 8
+          MAX_INDEX_DESCRIPTORS = 256
+
           layout = pathlib.Path(os.environ["OCI_LAYOUT"])
           try:
               layout_metadata = json.loads((layout / "oci-layout").read_text())
-              index = json.loads((layout / "index.json").read_text())
+              index_bytes = (layout / "index.json").read_bytes()
+              index = json.loads(index_bytes)
           except (OSError, json.JSONDecodeError) as error:
               sys.exit(f"Invalid OCI layout: {error}")
 
           if layout_metadata.get("imageLayoutVersion") != "1.0.0":
               sys.exit("Unsupported OCI layout version")
 
-          descriptors = index.get("manifests")
-          if not isinstance(descriptors, list):
-              sys.exit("OCI index has no manifest descriptor list")
-
-          candidates = [
-              descriptor
-              for descriptor in descriptors
-              if isinstance(descriptor, dict)
-              and descriptor.get("mediaType") == "application/vnd.oci.image.manifest.v1+json"
-              and descriptor.get("platform", {}).get("os") == "linux"
-              and descriptor.get("platform", {}).get("architecture") == "amd64"
-          ]
-          if len(candidates) != 1:
-              sys.exit(f"Expected one linux/amd64 OCI image manifest, found {len(candidates)}")
-
-          digest = candidates[0].get("digest", "")
-          match = re.fullmatch(r"sha256:([0-9a-f]{64})", digest)
-          if not match:
-              sys.exit("OCI manifest descriptor has an invalid SHA-256 digest")
-
           def verify_blob(descriptor, label):
+              if not isinstance(descriptor, dict):
+                  sys.exit(f"{label} descriptor is invalid")
               blob_digest = descriptor.get("digest", "")
               blob_match = re.fullmatch(r"sha256:([0-9a-f]{64})", blob_digest)
               if not blob_match:
                   sys.exit(f"{label} has an invalid SHA-256 digest")
+              size = descriptor.get("size")
+              if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+                  sys.exit(f"{label} has an invalid size")
               blob_path = layout / "blobs" / "sha256" / blob_match.group(1)
               try:
                   blob_bytes = blob_path.read_bytes()
               except OSError as error:
                   sys.exit(f"{label} blob is missing: {error}")
               if (
-                  descriptor.get("size") != len(blob_bytes)
+                  size != len(blob_bytes)
                   or hashlib.sha256(blob_bytes).hexdigest() != blob_match.group(1)
               ):
                   sys.exit(f"{label} blob does not match its OCI descriptor")
               return blob_bytes
 
-          try:
-              manifest = json.loads(verify_blob(candidates[0], "OCI image manifest"))
-          except json.JSONDecodeError as error:
-              sys.exit(f"OCI image manifest is not valid JSON: {error}")
-          if manifest.get("schemaVersion") != 2 or not isinstance(manifest.get("layers"), list):
-              sys.exit("OCI image manifest has an unsupported schema")
+          def parse_json_object(blob_bytes, label):
+              try:
+                  value = json.loads(blob_bytes)
+              except json.JSONDecodeError as error:
+                  sys.exit(f"{label} is not valid JSON: {error}")
+              if not isinstance(value, dict):
+                  sys.exit(f"{label} is not a JSON object")
+              return value
 
-          try:
-              image_config = json.loads(verify_blob(manifest.get("config", {}), "Image config"))
-          except json.JSONDecodeError as error:
-              sys.exit(f"OCI image config is not valid JSON: {error}")
-          if image_config.get("os") != "linux" or image_config.get("architecture") != "amd64":
-              sys.exit("OCI image config platform does not match linux/amd64")
-          for layer_number, layer in enumerate(manifest["layers"], start=1):
-              verify_blob(layer, f"Image layer {layer_number}")
+          def is_attestation(descriptor, manifest=None):
+              annotations = descriptor.get("annotations") or {}
+              if annotations.get("vnd.docker.reference.type") == "attestation-manifest":
+                  return True
+              if manifest is None:
+                  return False
+              if manifest.get("artifactType") or manifest.get("subject") is not None:
+                  return True
+              config = manifest.get("config") or {}
+              return config.get("mediaType") == "application/vnd.oci.empty.v1+json"
+
+          def merge_platform(platform, inherited):
+              if platform is None:
+                  return inherited
+              if not isinstance(platform, dict):
+                  sys.exit("OCI image descriptor has invalid platform metadata")
+              current = (platform.get("os"), platform.get("architecture"))
+              if inherited is not None:
+                  for parent_value, current_value in zip(inherited, current):
+                      if current_value not in (None, "unknown", parent_value):
+                          sys.exit("Nested OCI index platform conflicts with its child descriptor")
+                  current = tuple(
+                      parent_value if current_value in (None, "unknown") else current_value
+                      for parent_value, current_value in zip(inherited, current)
+                  )
+              else:
+                  current = tuple(None if value in (None, "unknown") else value for value in current)
+              return current if any(current) else None
+
+          if not isinstance(index, dict) or index.get("schemaVersion") != 2:
+              sys.exit("OCI root index has an unsupported schema")
+          if index.get("mediaType") not in (None, "application/vnd.oci.image.index.v1+json"):
+              sys.exit("OCI root index has an unsupported media type")
+
+          candidates = {}
+          active_indexes = {"sha256:" + hashlib.sha256(index_bytes).hexdigest()}
+          visited_indexes = set()
+          descriptor_count = 0
+          attestation_count = 0
+
+          def visit_index(current_index, depth, label, expected_platform=None):
+              global descriptor_count, attestation_count
+              if depth > MAX_INDEX_DEPTH:
+                  sys.exit(f"OCI index nesting exceeds {MAX_INDEX_DEPTH} levels")
+              descriptors = current_index.get("manifests")
+              if not isinstance(descriptors, list):
+                  sys.exit(f"{label} has no manifest descriptor list")
+
+              for descriptor in descriptors:
+                  descriptor_count += 1
+                  if descriptor_count > MAX_INDEX_DESCRIPTORS:
+                      sys.exit(f"OCI index tree exceeds {MAX_INDEX_DESCRIPTORS} descriptors")
+                  if not isinstance(descriptor, dict):
+                      sys.exit(f"{label} contains an invalid descriptor")
+
+                  media_type = descriptor.get("mediaType")
+                  if media_type not in INDEX_MEDIA_TYPES | IMAGE_MEDIA_TYPES:
+                      # Keep non-image artifacts in the original layout; they are not runnable images.
+                      continue
+
+                  descriptor_digest = descriptor.get("digest", "")
+                  blob_bytes = verify_blob(descriptor, f"{label} child")
+                  if is_attestation(descriptor):
+                      # Attestations remain in the archive/layout; they are excluded only from runtime selection.
+                      attestation_count += 1
+                      continue
+                  child_expected_platform = merge_platform(descriptor.get("platform"), expected_platform)
+
+                  if media_type in INDEX_MEDIA_TYPES:
+                      if descriptor_digest in active_indexes:
+                          sys.exit("OCI index tree contains a digest cycle")
+                      if descriptor_digest in visited_indexes:
+                          continue
+                      child_index = parse_json_object(blob_bytes, "OCI child index")
+                      if child_index.get("schemaVersion") != 2:
+                          sys.exit("OCI child index has an unsupported schema")
+                      child_media_type = child_index.get("mediaType")
+                      if child_media_type not in (None, media_type):
+                          sys.exit("OCI child index media type does not match its descriptor")
+                      active_indexes.add(descriptor_digest)
+                      visit_index(child_index, depth + 1, "OCI child index", child_expected_platform)
+                      active_indexes.remove(descriptor_digest)
+                      visited_indexes.add(descriptor_digest)
+                      continue
+
+                  manifest = parse_json_object(blob_bytes, "OCI image manifest")
+                  if manifest.get("schemaVersion") != 2:
+                      sys.exit("OCI image manifest has an unsupported schema")
+                  manifest_media_type = manifest.get("mediaType")
+                  if manifest_media_type not in (None, media_type):
+                      sys.exit("OCI image manifest media type does not match its descriptor")
+                  if is_attestation(descriptor, manifest):
+                      attestation_count += 1
+                      continue
+
+                  config_descriptor = manifest.get("config")
+                  config_media_type = config_descriptor.get("mediaType") if isinstance(config_descriptor, dict) else None
+                  if config_media_type not in IMAGE_CONFIG_MEDIA_TYPES:
+                      sys.exit("OCI image manifest has an unsupported image config media type")
+                  image_config = parse_json_object(verify_blob(config_descriptor, "Image config"), "OCI image config")
+                  image_os = image_config.get("os")
+                  image_architecture = image_config.get("architecture")
+                  if not isinstance(image_os, str) or not isinstance(image_architecture, str):
+                      sys.exit("OCI image config is missing its platform")
+
+                  if child_expected_platform is not None and (
+                      child_expected_platform[0] not in (None, image_os)
+                      or child_expected_platform[1] not in (None, image_architecture)
+                  ):
+                      sys.exit("OCI descriptor platform conflicts with its image config")
+
+                  if (image_os, image_architecture) != ("linux", "amd64"):
+                      continue
+
+                  layers = manifest.get("layers")
+                  if not isinstance(layers, list):
+                      sys.exit("OCI image manifest has no layer descriptor list")
+                  for layer_number, layer in enumerate(layers, start=1):
+                      verify_blob(layer, f"Image layer {layer_number}")
+                  candidates[descriptor_digest] = descriptor
+
+          visit_index(index, 0, "OCI root index")
+          if len(candidates) != 1:
+              sys.exit(f"Expected one linux/amd64 runtime image manifest, found {len(candidates)}")
+          digest = next(iter(candidates))
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"digest={digest}\n")
-          print(f"Verified linux/amd64 OCI manifest {digest}")
+          print(
+              f"Verified linux/amd64 OCI manifest {digest}; visited {len(visited_indexes) + 1} index(es), "
+              f"{descriptor_count} descriptor(s), retained {attestation_count} attestation descriptor(s)"
+          )
           PY
 
       - name: Generate SBOM and enforce High/Critical gate
