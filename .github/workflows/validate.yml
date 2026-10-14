@@ -263,7 +263,7 @@ jobs:
           image: oci-archive:${{ runner.temp }}/brands-validation.oci.tar
           platforms: linux/amd64
           report-directory: ${{ runner.temp }}/container-security/brands-validation
-          artifact-name: container-security-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          artifact-name: security-high-critical-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Run validation against the exact scanned image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0

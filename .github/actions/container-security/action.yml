@@ -73,4 +73,4 @@ runs:
         name: ${{ inputs.artifact-name }}
         path: ${{ inputs.report-directory }}/security-high-critical.json
         retention-days: 1
-        if-no-files-found: ignore
+        if-no-files-found: error
