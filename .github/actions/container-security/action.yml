@@ -1,5 +1,5 @@
 name: Container security gate
-description: Generate a Syft SBOM and fail on any High or Critical Grype finding for every image platform.
+description: Generate a Syft SBOM, fail on any High or Critical Grype finding for each image platform, and retain only compact findings.
 inputs:
   image:
     description: Immutable registry digest or local OCI archive to scan
@@ -40,11 +40,37 @@ runs:
         # the job's disk-backed temp directory for larger image layers.
         TMPDIR: ${{ runner.temp }}
       run: bash "$SECURITY_ACTION_PATH/container-security.sh" scan
-    - name: Retain SBOMs and vulnerability reports
+    - name: Minimize High/Critical findings
+      if: ${{ always() }}
+      shell: bash
+      env:
+        SECURITY_REPORT_DIRECTORY: ${{ inputs.report-directory }}
+        SECURITY_IMAGE: ${{ inputs.image }}
+        SECURITY_PLATFORMS: ${{ inputs.platforms }}
+        SECURITY_ACTION_PATH: ${{ github.action_path }}
+      run: |
+        shopt -s nullglob
+        reports=("$SECURITY_REPORT_DIRECTORY"/*.grype.json)
+        if (( ${#reports[@]} == 0 )); then
+          echo "No completed Grype JSON reports to retain."
+          exit 0
+        fi
+        args=()
+        for report in "${reports[@]}"; do
+          args+=(--input "$report")
+        done
+        python3 "$SECURITY_ACTION_PATH/minimize-security-reports.py" \
+          "${args[@]}" \
+          --output "$SECURITY_REPORT_DIRECTORY/security-high-critical.json" \
+          --repository "$GITHUB_REPOSITORY" \
+          --revision "$GITHUB_SHA" \
+          --image "$SECURITY_IMAGE" \
+          --platform "$SECURITY_PLATFORMS"
+    - name: Retain minimized High/Critical findings
       if: ${{ always() }}
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: ${{ inputs.artifact-name }}
-        path: ${{ inputs.report-directory }}/
-        retention-days: 14
-        if-no-files-found: warn
+        path: ${{ inputs.report-directory }}/security-high-critical.json
+        retention-days: 1
+        if-no-files-found: ignore

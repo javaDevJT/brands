@@ -13,7 +13,7 @@ permissions:
 jobs:
   check:
     name: Check for new custom integrations
-    runs-on: ubuntu-latest
+    runs-on: truenas-brands-storage-8g
     steps:
       - name: Get added folders
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0

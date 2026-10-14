@@ -9,10 +9,13 @@ on:
 
 env:
   DOCKER_BUILD_RECORD_UPLOAD: "false"
+  BUILDKIT_TLS_CA_CERT: /run/buildkit/tls/ca.pem
+  BUILDKIT_TLS_CLIENT_CERT: /run/buildkit/tls/client.pem
+  BUILDKIT_TLS_CLIENT_KEY: /run/buildkit/tls/client.key
 jobs:
   validate:
     name: Images
-    runs-on: ubuntu-latest
+    runs-on: truenas-brands-storage-8g
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -26,35 +29,152 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
-          driver: docker-container
+          driver: remote
+          endpoint: tcp://buildkit:1234
+          cache-binary: false
+          driver-opts: |
+            cacert=${{ env.BUILDKIT_TLS_CA_CERT }}
+            cert=${{ env.BUILDKIT_TLS_CLIENT_CERT }}
+            key=${{ env.BUILDKIT_TLS_CLIENT_KEY }}
       - name: Build validation image
         id: validation-image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
-          context: .github/workflows/validate
-          file: .github/workflows/validate/Dockerfile
+          context: .
+          file: .github/actions/container-security/brands-validation.Dockerfile
+          target: runtime
           platforms: linux/amd64
-          tags: brands-image-validation:${{ github.run_id }}-${{ github.run_attempt }}
-          load: true
-          cache-from: type=gha,scope=brands-image-validation-linux-amd64
-          cache-to: type=gha,scope=brands-image-validation-linux-amd64,mode=max,ignore-error=true
-          no-cache-filters: runtime
+          outputs: type=oci,dest=${{ runner.temp }}/brands-validation.oci.tar
+          no-cache: true
           push: false
+
+      - name: Extract and verify scanned image identity
+        id: scanned-image
+        shell: bash
+        env:
+          OCI_ARCHIVE: ${{ runner.temp }}/brands-validation.oci.tar
+          OCI_LAYOUT: ${{ runner.temp }}/brands-validation-oci
+        run: |
+          set -euo pipefail
+          mkdir -p "$OCI_LAYOUT"
+          tar -xf "$OCI_ARCHIVE" -C "$OCI_LAYOUT"
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import sys
+
+          layout = pathlib.Path(os.environ["OCI_LAYOUT"])
+          try:
+              layout_metadata = json.loads((layout / "oci-layout").read_text())
+              index = json.loads((layout / "index.json").read_text())
+          except (OSError, json.JSONDecodeError) as error:
+              sys.exit(f"Invalid OCI layout: {error}")
+
+          if layout_metadata.get("imageLayoutVersion") != "1.0.0":
+              sys.exit("Unsupported OCI layout version")
+
+          descriptors = index.get("manifests")
+          if not isinstance(descriptors, list):
+              sys.exit("OCI index has no manifest descriptor list")
+
+          candidates = [
+              descriptor
+              for descriptor in descriptors
+              if isinstance(descriptor, dict)
+              and descriptor.get("mediaType") == "application/vnd.oci.image.manifest.v1+json"
+              and descriptor.get("platform", {}).get("os") == "linux"
+              and descriptor.get("platform", {}).get("architecture") == "amd64"
+          ]
+          if len(candidates) != 1:
+              sys.exit(f"Expected one linux/amd64 OCI image manifest, found {len(candidates)}")
+
+          digest = candidates[0].get("digest", "")
+          match = re.fullmatch(r"sha256:([0-9a-f]{64})", digest)
+          if not match:
+              sys.exit("OCI manifest descriptor has an invalid SHA-256 digest")
+
+          def verify_blob(descriptor, label):
+              blob_digest = descriptor.get("digest", "")
+              blob_match = re.fullmatch(r"sha256:([0-9a-f]{64})", blob_digest)
+              if not blob_match:
+                  sys.exit(f"{label} has an invalid SHA-256 digest")
+              blob_path = layout / "blobs" / "sha256" / blob_match.group(1)
+              try:
+                  blob_bytes = blob_path.read_bytes()
+              except OSError as error:
+                  sys.exit(f"{label} blob is missing: {error}")
+              if (
+                  descriptor.get("size") != len(blob_bytes)
+                  or hashlib.sha256(blob_bytes).hexdigest() != blob_match.group(1)
+              ):
+                  sys.exit(f"{label} blob does not match its OCI descriptor")
+              return blob_bytes
+
+          try:
+              manifest = json.loads(verify_blob(candidates[0], "OCI image manifest"))
+          except json.JSONDecodeError as error:
+              sys.exit(f"OCI image manifest is not valid JSON: {error}")
+          if manifest.get("schemaVersion") != 2 or not isinstance(manifest.get("layers"), list):
+              sys.exit("OCI image manifest has an unsupported schema")
+
+          try:
+              image_config = json.loads(verify_blob(manifest.get("config", {}), "Image config"))
+          except json.JSONDecodeError as error:
+              sys.exit(f"OCI image config is not valid JSON: {error}")
+          if image_config.get("os") != "linux" or image_config.get("architecture") != "amd64":
+              sys.exit("OCI image config platform does not match linux/amd64")
+          for layer_number, layer in enumerate(manifest["layers"], start=1):
+              verify_blob(layer, f"Image layer {layer_number}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"digest={digest}\n")
+          print(f"Verified linux/amd64 OCI manifest {digest}")
+          PY
 
       - name: Generate SBOM and enforce High/Critical gate
         uses: ./.github/actions/container-security
         with:
-          image: docker:${{ steps.validation-image.outputs.imageid }}
+          image: oci-archive:${{ runner.temp }}/brands-validation.oci.tar
           platforms: linux/amd64
           report-directory: ${{ runner.temp }}/container-security/brands-validation
           artifact-name: container-security-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: Run image validation
+      - name: Run validation against the exact scanned image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: .github/actions/container-security/brands-validation.Dockerfile
+          target: validate
+          platforms: linux/amd64
+          build-contexts: |
+            scanned=oci-layout://${{ runner.temp }}/brands-validation-oci@${{ steps.scanned-image.outputs.digest }}
+          outputs: type=cacheonly
+          no-cache: true
+
+  cleanup-artifacts:
+    name: Remove transient build artifacts
+    needs: ["validate"]
+    if: ${{ always() && ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: truenas-brands-storage-8g
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Check out trusted default branch cleanup code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Set up Python for bounded cleanup
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Delete non-retained current-run artifacts
         env:
-          VALIDATION_IMAGE: ${{ steps.validation-image.outputs.imageid }}
-        run: |
-          docker run --rm \
-            --volume "$GITHUB_WORKSPACE:/github/workspace" \
-            --workdir /github/workspace \
-            --env GITHUB_ACTIONS=true \
-            "$VALIDATION_IMAGE"
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/cleanup-actions-artifacts.py --current
+

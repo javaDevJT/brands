@@ -12,18 +12,38 @@ on:
 jobs:
   compress:
     name: Images
-    runs-on: ubuntu-latest
+    runs-on: truenas-brands-storage-8g
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Check out the pinned image action source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: calibreapp/image-actions
+          ref: 9d037c06280028c110ff61c433ad4dc7d33c3c43
+          path: .image-actions
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
       - name: Find symlinked paths to ignore
         id: find
-        run: >-
-          echo "::set-output name=ignore::$(find -L src -xtype l -type d | sed -e 's#$#/**#' | head -c -1 | tr '\n' ',')"
+        shell: bash
+        run: |
+          ignore="$(find -L src -xtype l -type d | sed -e 's#$#/**#' | head -c -1 | tr '\n' ',')"
+          echo "ignore=$ignore" >> "$GITHUB_OUTPUT"
       - name: Check ignored paths
-        run: echo ${{ steps.find.outputs.ignore }} | tr ',' '\n'
+        run: echo "${{ steps.find.outputs.ignore }}" | tr ',' '\n'
+      - name: Install pinned image action dependencies
+        working-directory: .image-actions
+        run: npm ci
       - name: Compress Images
-        uses: calibreapp/image-actions@9d037c06280028c110ff61c433ad4dc7d33c3c43 # 1.5.0
-        with:
-          ignorePaths: ${{ steps.find.outputs.ignore }}
-          githubToken: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: .image-actions
+        env:
+          INPUT_IGNOREPATHS: ${{ steps.find.outputs.ignore }}
+          INPUT_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node --experimental-strip-types entrypoint.ts
